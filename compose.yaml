@@ -71,7 +71,9 @@ services:
 
   worker:
     <<: *app
-    command: ["celery", "-A", "radar_alerts", "worker", "-l", "info", "-n", "worker@%h"]
+    command: >-
+      celery -A radar_alerts worker -l info -n worker@%h
+      --concurrency ${WORKER_CONCURRENCY:-2}
     environment:
       <<: *app-env
       CLICKHOUSE_URL: ${DOCKER_CLICKHOUSE_URL:-http://clickhouse:8123}

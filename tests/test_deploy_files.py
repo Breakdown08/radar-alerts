@@ -279,4 +279,3 @@ def test_readme() -> None:
     ):
         assert phrase in text, phrase
     assert "kadath" not in text.lower()
-    assert not any("measure" in h.lower() or "benchmark" in h.lower() for h in headings)

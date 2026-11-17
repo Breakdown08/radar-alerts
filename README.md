@@ -10,8 +10,8 @@ scheduler. Its only dependency on the radar is a versioned read-only SQL interfa
 
 ## What is not there yet
 
-- **No TLS and no reverse proxy.** The service listens on `127.0.0.1:8000`. The Telegram webhook has not
-  been checked live yet, only by tests.
+- **No TLS and no reverse proxy.** The service listens on `127.0.0.1:8000`. The Telegram webhook is checked by tests
+  and locally with a forged update, not live through Telegram.
 - **Missed checks are not caught up.** Every check looks only at the latest period. If the worker was down for
   three hours, transitions inside those hours are not reported.
 - **Steam growth assumes the collector polls hourly** (the radar's default `STEAM_POLL_INTERVAL_SECONDS=3600`).
@@ -91,6 +91,7 @@ start only after it finished successfully, so no two processes migrate at once. 
   (`celery inspect ping`). `beat` has none: it listens on nothing, and a check by the age of its schedule file
   is fragile. `restart: unless-stopped` revives it; look for `Scheduler: Sending due task` in its log.
 - `beat` must run as exactly one instance. `worker` can be scaled: `docker compose up -d --scale worker=2`.
+  Each worker runs `WORKER_CONCURRENCY` processes (default 2): the load is a few queries every 5 minutes.
 - `DJANGO_ALLOWED_HOSTS` must contain `localhost`, otherwise the `web` health check gets 400.
 - `db` and `rabbitmq` are also published on `127.0.0.1`, so development on the host with `uv run` (see Run)
   still works.
@@ -127,6 +128,37 @@ with 409.
 - `telegram_webhook info` prints the URL, the pending update count and the last error.
 
 An update is handled once: the offset cursor is shared by both modes, so a repeat from Telegram is dropped.
+
+## Measured
+
+One run on the author's machine (22 CPUs, Docker Compose 5.7.0) on 2026-11-17, next to a running radar
+(ClickHouse 26.8.36.3), with one active rule.
+
+| What | Value | How |
+|---|---|---|
+| Cold start after `docker compose down`, image cached | 21.5 s | `time docker compose up -d --build --wait` |
+| Image build without cache (base images pulled) | 19.2 s | `time docker compose build --no-cache` |
+| Start with a ready image, `db` and `rabbitmq` running | 10.5 s | `time docker compose up -d --wait` |
+| Image size | 485 MB | `docker image ls radar-alerts:local` |
+| `check_rules`, three queries to the views | 0.04 s | `succeeded in ...s` in `docker compose logs worker` |
+| Firing created after the end of its hour | 10 min | `created_at - period`: 5 min data lag + the 5 min `check_rules` step |
+| Firing queued to sent | 0.02 s | `sent_at - created_at` in the admin |
+| RabbitMQ restart to worker reconnected | 4 s | `docker compose restart rabbitmq`, `Connected to amqp://` in the worker log |
+
+Memory (`docker stats --no-stream`): `worker` 157 MiB with `WORKER_CONCURRENCY=2`, `rabbitmq` 103 MiB, `web`
+76 MiB, `beat` 72 MiB, `db` 26 MiB. Before the limit the worker ran Celery's default of one prefork process per
+CPU, 22 here, and took 1009 MiB.
+
+Checked by hand in the same run: the `radar_alerts` user gets `ACCESS_DENIED` on `radar.observations` and on
+`CREATE TABLE`; with a wrong `CLICKHOUSE_DATABASE` `check_radar_contract` exits with 1, the worker logs ERROR
+and the bot still answers `/start`; no value of `TELEGRAM_BOT_TOKEN`, `CLICKHOUSE_PASSWORD`,
+`POSTGRES_PASSWORD`, `RABBITMQ_PASSWORD` or `DJANGO_SECRET_KEY` from `.env` appears in `docker compose logs`;
+the webhook answers 200 with a `sendMessage` to a forged `/start` with the right secret and 403 with a wrong one.
+
+- A RabbitMQ restart in the middle of a task logs `CRITICAL Couldn't ack`. The message is delivered again and
+  the tasks are idempotent, so nothing is sent twice.
+- `restart: unless-stopped` does not revive a container after `docker compose kill`: Docker treats it as a
+  manual stop. A worker whose main process exits is restarted and turns healthy again.
 
 ## API
 
@@ -182,6 +214,7 @@ curl -s -H "Authorization: Token $TOKEN" -H "Content-Type: application/json" \
 | `TELEGRAM_WEBHOOK_URL` | empty | public `https://` base URL, used by `telegram_webhook set` |
 | `TELEGRAM_API_URL` | `https://api.telegram.org` | Bot API base URL; changed only in CI, to a fake Telegram |
 | `WEB_PORT` | `8000` | compose only: web port on `127.0.0.1` |
+| `WORKER_CONCURRENCY` | `2` | compose only: Celery worker processes (Celery's own default is one per CPU) |
 | `DOCKER_CLICKHOUSE_URL` | `http://clickhouse:8123` | compose only: `CLICKHOUSE_URL` inside `worker` |
 | `RADAR_DOCKER_NETWORK` | `gamedev-trends_default` | compose only: the radar's external docker network |
 | `RADAR_BLUESKY_TAGS` | `gamedev,indiedev,indiegame,godot,pixelart,screenshotsaturday,mobilegame` | tags the radar collects |
