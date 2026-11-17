@@ -1,9 +1,10 @@
-"""Check 37: the three ClickHouseRadar reads against a live ClickHouse, and the GET read-only guarantee."""
+"""Checks 15 and 16 (and 37 of task 2): the radar reads and the contract against live ClickHouse views."""
 
 import json
 import os
 from collections.abc import Iterator
 from datetime import UTC, datetime
+from pathlib import Path
 
 import httpx
 import pytest
@@ -13,6 +14,8 @@ from radar_alerts.alerts.radar import ClickHouseRadar, SteamChart
 pytestmark: list[pytest.MarkDecorator] = [pytest.mark.clickhouse]
 
 DB: str = "radar_alerts_test"
+CONTRACT_DB: str = "radar_alerts_test_v1"
+CONTRACT_SQL: Path = Path(__file__).with_name("radar_contract_v1.sql")
 DDL: str = f"""CREATE TABLE {DB}.observations (
     event_id UUID, source LowCardinality(String), entity_type LowCardinality(String), entity_id String,
     metric LowCardinality(String), value Float64, observed_at DateTime64(6,'UTC'),
@@ -93,26 +96,39 @@ def clickhouse() -> Iterator[httpx.Client]:
     def execute(sql: str) -> None:
         client.post("/", content=sql).raise_for_status()
 
+    execute(f"DROP DATABASE IF EXISTS {CONTRACT_DB}")
     execute(f"DROP DATABASE IF EXISTS {DB}")
     execute(f"CREATE DATABASE {DB}")
     execute(DDL)
+    statement: str
+    for statement in (
+        CONTRACT_SQL.read_text().replace("{source}", DB).replace("{contract}", CONTRACT_DB).split(";")
+    ):
+        if statement.strip():
+            execute(statement)
     body: str = "\n".join(json.dumps(r) for r in rows())
     client.post(
         "/", params={"query": f"INSERT INTO {DB}.observations FORMAT JSONEachRow"}, content=body
     ).raise_for_status()
     yield client
+    execute(f"DROP DATABASE IF EXISTS {CONTRACT_DB}")
     execute(f"DROP DATABASE IF EXISTS {DB}")
     client.close()
 
 
-def radar_for(clickhouse: httpx.Client) -> ClickHouseRadar:
+def radar_for(clickhouse: httpx.Client, database: str = CONTRACT_DB) -> ClickHouseRadar:
     return ClickHouseRadar(
         httpx.Client(timeout=30.0),
         url=str(clickhouse.base_url).rstrip("/"),
         user=clickhouse.headers["X-ClickHouse-User"],
         password=clickhouse.headers["X-ClickHouse-Key"],
-        database=DB,
+        database=database,
     )
+
+
+def test_contract_matches(clickhouse: httpx.Client) -> None:
+    """Check 15."""
+    assert radar_for(clickhouse).contract_problems() == []
 
 
 def test_steam_players(clickhouse: httpx.Client) -> None:
@@ -146,3 +162,19 @@ def test_get_requests_cannot_write(clickhouse: httpx.Client) -> None:
     assert attempt.status_code != 200
     assert "READONLY" in attempt.text
     assert clickhouse.get("/", params={"query": count_sql}).text.strip() == before
+    through_view: httpx.Response = clickhouse.get(
+        "/",
+        params={
+            "query": f"INSERT INTO {CONTRACT_DB}.steam_players SELECT * FROM {CONTRACT_DB}.steam_players"
+        },
+    )
+    assert through_view.status_code != 200
+    assert clickhouse.get("/", params={"query": count_sql}).text.strip() == before
+
+
+def test_dropped_view_is_one_problem(clickhouse: httpx.Client) -> None:
+    """Check 16."""
+    clickhouse.post("/", content=f"DROP VIEW {CONTRACT_DB}.steam_chart").raise_for_status()
+    problems: list[str] = radar_for(clickhouse).contract_problems()
+    assert len(problems) == 1
+    assert problems[0].startswith(f"{CONTRACT_DB}.steam_chart:")

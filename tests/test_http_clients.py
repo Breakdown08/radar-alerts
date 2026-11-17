@@ -1,4 +1,4 @@
-"""Checks 34 to 36: ClickHouseRadar and HttpTelegram over httpx.MockTransport, no network."""
+"""Checks 11-14 (task 3), 34-36 (task 2): ClickHouseRadar and HttpTelegram over httpx.MockTransport."""
 
 import json
 from collections.abc import Callable
@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 import httpx
 import pytest
 
-from radar_alerts.alerts.radar import ClickHouseRadar, RadarError
+from radar_alerts.alerts.radar import ClickHouseRadar, RadarError, SteamChart
 from radar_alerts.alerts.telegram import HttpTelegram, TelegramError
 
 type Handler = Callable[[httpx.Request], httpx.Response]
@@ -26,21 +26,21 @@ def radar_with(handler: Handler) -> ClickHouseRadar:
     return ClickHouseRadar(
         httpx.Client(transport=httpx.MockTransport(handler)),
         url="http://clickhouse:8123",
-        user="radar",
+        user="radar_alerts",
         password=PASSWORD,
-        database="radar",
+        database="alerts_v1",
     )
 
 
 def test_steam_players_request_and_parsing() -> None:
-    """Check 34."""
+    """Check 11."""
     seen: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request)
         rows: list[str] = [
-            '{"entity_id":"570","observed_at":"2026-11-17 12:00:00.000000","value":1234.0}',
-            '{"entity_id":"570","observed_at":"2026-11-17 13:00:00.000000","value":1300.0}',
+            '{"appid":"570","observed_at":"2026-11-17 12:00:00.000000","players":1234}',
+            '{"appid":"570","observed_at":"2026-11-17 13:00:00.000000","players":"1300"}',
         ]
         return httpx.Response(200, text="\n".join(rows) + "\n")
 
@@ -56,20 +56,57 @@ def test_steam_players_request_and_parsing() -> None:
     assert request.method == "GET"
     assert request.url.host == "clickhouse"
     assert request.url.path == "/"
-    assert request.headers["X-ClickHouse-User"] == "radar"
+    assert request.headers["X-ClickHouse-User"] == "radar_alerts"
     assert request.headers["X-ClickHouse-Key"] == PASSWORD
     query: str = request.url.params["query"]
     assert query.rstrip().endswith("FORMAT JSONEachRow")
+    assert "alerts_v1.steam_players" in query
+    assert "observations" not in query
+    assert "FINAL" not in query
     assert "570" not in query
     assert "2026-11-17" not in query
     values: list[str] = param_values(request)
     assert any("570" in v for v in values)
     assert "2026-11-17 10:00:00" in values
-    assert "radar.observations" in query
+
+
+def test_steam_chart_reads_the_view() -> None:
+    """Check 12: both requests go to alerts_v1.steam_chart; the answer becomes a SteamChart."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if "param_days" not in request.url.params:
+            return httpx.Response(
+                200,
+                text=(
+                    '{"chart_day":"2026-11-16 00:00:00.000000"}\n{"chart_day":"2026-11-15 00:00:00.000000"}\n'
+                ),
+            )
+        rows: list[str] = [
+            '{"appid":"570","chart_day":"2026-11-16 00:00:00.000000","rank":7}',
+            '{"appid":"570","chart_day":"2026-11-15 00:00:00.000000","rank":"12"}',
+            '{"appid":"730","chart_day":"2026-11-15 00:00:00.000000","rank":3}',
+        ]
+        return httpx.Response(200, text="\n".join(rows) + "\n")
+
+    chart: SteamChart = radar_with(handler).steam_chart(["570", "730"], SINCE)
+    day16: datetime = datetime(2026, 11, 16, tzinfo=UTC)
+    day15: datetime = datetime(2026, 11, 15, tzinfo=UTC)
+    assert chart == SteamChart(days=(day16, day15), ranks={day16: {"570": 7}, day15: {"570": 12, "730": 3}})
+    assert len(seen) == 2
+    request: httpx.Request
+    for request in seen:
+        assert request.method == "GET"
+        query: str = request.url.params["query"]
+        assert "alerts_v1.steam_chart" in query
+        assert "observations" not in query
+        assert "FINAL" not in query
+        assert "570" not in query
 
 
 def test_empty_inputs_make_no_request() -> None:
-    """Check 35: nothing to look for, nothing to ask."""
+    """Check 14: nothing to look for, nothing to ask."""
     calls: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -85,7 +122,7 @@ def test_empty_inputs_make_no_request() -> None:
 @pytest.mark.parametrize("hour", ["2026-11-17 11:00:00", "2026-11-17 11:00:00.000000"])
 @pytest.mark.parametrize("posts", ['"15"', "15"])
 def test_tag_counts_parses_string_and_number(hour: str, posts: str) -> None:
-    """Check 35: UInt64 comes as a string by default; both forms parse."""
+    """Check 13: UInt64 may come as a string or as a number; both forms parse."""
     body: str = '{"tag":"godot","hour":"' + hour + '","posts":' + posts + "}\n"
     radar: ClickHouseRadar = radar_with(lambda request: httpx.Response(200, text=body))
     assert radar.tag_counts(["godot"], SINCE, UNTIL) == {
@@ -94,7 +131,7 @@ def test_tag_counts_parses_string_and_number(hour: str, posts: str) -> None:
 
 
 def test_tag_counts_request_shape() -> None:
-    """Check 34/35: GET with parameters, no values in the SQL."""
+    """Check 13: the view, tag names (not metrics) in the parameters, no values in the SQL."""
     seen: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -104,9 +141,14 @@ def test_tag_counts_request_shape() -> None:
     assert radar_with(handler).tag_counts(["godot"], SINCE, UNTIL) == {}
     request: httpx.Request = seen[0]
     assert request.method == "GET"
-    assert "godot" not in request.url.params["query"]
+    query: str = request.url.params["query"]
+    assert "alerts_v1.bluesky_tag_hourly" in query
+    assert "observations" not in query
+    assert "FINAL" not in query
+    assert "godot" not in query
     values: list[str] = param_values(request)
     assert any("godot" in v for v in values)
+    assert not any("tag_godot" in v for v in values)
     assert {"2026-11-17 10:00:00", "2026-11-17 14:00:00"} <= set(values)
 
 
@@ -128,7 +170,7 @@ def failing_missing_field(request: httpx.Request) -> httpx.Response:
 
 @pytest.mark.parametrize("handler", [failing_500, failing_connect, failing_garbage, failing_missing_field])
 def test_radar_errors(handler: Handler) -> None:
-    """Check 35: every failure is a RadarError and never shows the password."""
+    """Check 14: every failure is a RadarError and never shows the password."""
     info: pytest.ExceptionInfo[RadarError]
     with pytest.raises(RadarError) as info:
         radar_with(handler).tag_counts(["godot"], SINCE, UNTIL)

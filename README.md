@@ -4,11 +4,14 @@ Subscriptions and alert rules for the gamedev-trends radar. A registered user su
 or a Bluesky tag and attaches rules to it ("players grew 30% in 24 hours", "the tag entered the top 10").
 Django 6.1 + Django REST framework, PostgreSQL (or SQLite for development and tests).
 
-A separate service with its own database, a RabbitMQ broker, a Celery worker and a Celery beat scheduler.
-It is tied to the radar only by reading its ClickHouse.
+A separately deployed service with its own PostgreSQL, a RabbitMQ broker, a Celery worker and a Celery beat
+scheduler. Its only dependency on the radar is a versioned read-only SQL interface in the radar's ClickHouse
+(database `alerts_v1`).
 
 ## What is not there yet
 
+- **No TLS and no reverse proxy.** The service listens on `127.0.0.1:8000`. The Telegram webhook has not
+  been checked live yet, only by tests.
 - **Missed checks are not caught up.** Every check looks only at the latest period. If the worker was down for
   three hours, transitions inside those hours are not reported.
 - **Steam growth assumes the collector polls hourly** (the radar's default `STEAM_POLL_INTERVAL_SECONDS=3600`).
@@ -64,6 +67,67 @@ in the admin.
 and `GET /api/v1/me/` shows `telegram_chat_id`. `DELETE /api/v1/me/telegram-link/` unlinks the chat.
 Without `TELEGRAM_BOT_TOKEN` nothing is sent and bot polling does nothing.
 
+## Deploy
+
+```
+cp .env.example .env    # set POSTGRES_PASSWORD, RABBITMQ_PASSWORD, DJANGO_SECRET_KEY, TELEGRAM_BOT_TOKEN,
+                        # CLICKHOUSE_PASSWORD (the radar_alerts password from the radar's .env)
+docker compose up -d --build --wait
+docker compose exec web python manage.py createsuperuser
+docker compose exec worker python manage.py check_radar_contract
+```
+
+`docker compose up -d --build --wait` starts `db`, `rabbitmq`, `migrate`, `web`, `worker` and `beat` in their
+own network. `migrate` is a one-shot container: it applies migrations and exits, and `web`, `worker` and `beat`
+start only after it finished successfully, so no two processes migrate at once. `web` is gunicorn
+(`WEB_CONCURRENCY` sets the number of its workers) with static files served by whitenoise.
+
+- Only `worker` talks to the radar's ClickHouse. It joins the radar's external docker network, named by
+  `RADAR_DOCKER_NETWORK` (default `gamedev-trends_default`), and reaches ClickHouse at `DOCKER_CLICKHOUSE_URL`
+  (default `http://clickhouse:8123`). If the radar was never started, the network does not exist and
+  `docker compose up` refuses: create it with `docker network create gamedev-trends_default`. The stack then
+  runs without the radar and `check_rules` logs `RadarError`.
+- Health checks: `db`, `rabbitmq`, `web` (`/healthz`, which checks only the database) and `worker`
+  (`celery inspect ping`). `beat` has none: it listens on nothing, and a check by the age of its schedule file
+  is fragile. `restart: unless-stopped` revives it; look for `Scheduler: Sending due task` in its log.
+- `beat` must run as exactly one instance. `worker` can be scaled: `docker compose up -d --scale worker=2`.
+- `DJANGO_ALLOWED_HOSTS` must contain `localhost`, otherwise the `web` health check gets 400.
+- `db` and `rabbitmq` are also published on `127.0.0.1`, so development on the host with `uv run` (see Run)
+  still works.
+
+## Radar interface
+
+The service reads the radar only through the read-only SQL interface `alerts_v1` in the radar's ClickHouse,
+three views with fixed columns:
+
+| View | Columns |
+|---|---|
+| `steam_players` | `appid String`, `observed_at DateTime64(6, 'UTC')`, `players UInt32` |
+| `steam_chart` | `appid String`, `chart_day DateTime64(6, 'UTC')`, `rank UInt16` |
+| `bluesky_tag_hourly` | `tag LowCardinality(String)`, `hour DateTime('UTC')`, `posts UInt64` |
+
+It reads as the user `radar_alerts`, which has only `SELECT ON alerts_v1.*`. The views and the user are created
+by the radar, not by this service. The expected schema is in the code (`CONTRACT_COLUMNS`) and is compared with
+the real one by `python manage.py check_radar_contract` (exit code 1 and one line per problem on a mismatch) and
+by a log line at worker start (`radar contract v1 in alerts_v1: ok`, or one ERROR per problem). A mismatch
+does not stop the worker. A new version of the interface is a new database `alerts_v2` next to the old one.
+
+## Telegram webhook
+
+By default the bot uses long polling (`TELEGRAM_MODE=polling`). Webhook mode needs a public HTTPS address
+(Telegram accepts ports 443, 80, 88 and 8443). Telegram then posts updates to `POST /telegram/webhook/` with the
+header `X-Telegram-Bot-Api-Secret-Token`, which must equal `TELEGRAM_WEBHOOK_SECRET` (1-256 characters of
+`[A-Za-z0-9_-]`). Polling by `beat` is off in this mode. While a webhook is set, Telegram answers `getUpdates`
+with 409.
+
+- Switch to webhook: set `TELEGRAM_MODE=webhook`, `TELEGRAM_WEBHOOK_SECRET` and `TELEGRAM_WEBHOOK_URL`
+  (`https://...`) in `.env`, recreate `web`, `worker` and `beat`, then
+  `docker compose exec web python manage.py telegram_webhook set`.
+- Switch back: `telegram_webhook delete`, set `TELEGRAM_MODE=polling`, recreate the containers.
+- `telegram_webhook info` prints the URL, the pending update count and the last error.
+
+An update is handled once: the offset cursor is shared by both modes, so a repeat from Telegram is dropped.
+
 ## API
 
 All paths except the token need `Authorization: Token <key>`. Lists are paginated
@@ -108,11 +172,18 @@ curl -s -H "Authorization: Token $TOKEN" -H "Content-Type: application/json" \
 | `RABBITMQ_USER` | `radar_alerts` | |
 | `RABBITMQ_PASSWORD` | empty | required by `compose.yaml` |
 | `CLICKHOUSE_URL` | `http://localhost:8123` | the radar's ClickHouse |
-| `CLICKHOUSE_USER` | `radar` | |
+| `CLICKHOUSE_USER` | `radar_alerts` | read-only user of `alerts_v1` |
 | `CLICKHOUSE_PASSWORD` | empty | |
-| `CLICKHOUSE_DATABASE` | `radar` | letters, digits and `_`; goes into SQL |
+| `CLICKHOUSE_DATABASE` | `alerts_v1` | the interface database; letters, digits and `_`; goes into SQL |
 | `TELEGRAM_BOT_TOKEN` | empty | empty means no alerts are sent |
 | `TELEGRAM_BOT_USERNAME` | empty | bot name without `@`, for `deep_link` |
+| `TELEGRAM_MODE` | `polling` | `polling` or `webhook` |
+| `TELEGRAM_WEBHOOK_SECRET` | empty | required for `webhook`: 1-256 characters of `[A-Za-z0-9_-]` |
+| `TELEGRAM_WEBHOOK_URL` | empty | public `https://` base URL, used by `telegram_webhook set` |
+| `TELEGRAM_API_URL` | `https://api.telegram.org` | Bot API base URL; changed only in CI, to a fake Telegram |
+| `WEB_PORT` | `8000` | compose only: web port on `127.0.0.1` |
+| `DOCKER_CLICKHOUSE_URL` | `http://clickhouse:8123` | compose only: `CLICKHOUSE_URL` inside `worker` |
+| `RADAR_DOCKER_NETWORK` | `gamedev-trends_default` | compose only: the radar's external docker network |
 | `RADAR_BLUESKY_TAGS` | `gamedev,indiedev,indiegame,godot,pixelart,screenshotsaturday,mobilegame` | tags the radar collects |
 
 ## Development

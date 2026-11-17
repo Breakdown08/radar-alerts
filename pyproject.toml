@@ -12,6 +12,8 @@ dependencies = [
     "psycopg[binary]>=3.2",
     "celery>=5.7,<6",
     "httpx>=0.28",
+    "gunicorn>=27,<28",
+    "whitenoise>=6.12,<7",
 ]
 
 [dependency-groups]
@@ -21,8 +23,10 @@ dev = [
     "djangorestframework-stubs[compatible-mypy]>=3.18",
     "pytest>=8",
     "pytest-django>=4.9",
+    "pyyaml>=6.0",
     "ruff",
     "ty",
+    "types-pyyaml>=6.0",
 ]
 
 [build-system]
@@ -51,6 +55,7 @@ django_settings_module = "radar_alerts.settings"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+filterwarnings = ["ignore:No directory at:UserWarning"]
 DJANGO_SETTINGS_MODULE = "radar_alerts.settings"
 markers = [
     "postgres: needs PostgreSQL; skipped on SQLite",

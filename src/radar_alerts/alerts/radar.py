@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from typing import Protocol
 
 import httpx
+from django.conf import settings
 
 
 class RadarError(Exception):
@@ -17,6 +18,18 @@ class SteamChart:
     ranks: dict[datetime, dict[str, int]]
 
 
+CONTRACT_VERSION: int = 1
+CONTRACT_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
+    "steam_players": (("appid", "String"), ("observed_at", "DateTime64(6, 'UTC')"), ("players", "UInt32")),
+    "steam_chart": (("appid", "String"), ("chart_day", "DateTime64(6, 'UTC')"), ("rank", "UInt16")),
+    "bluesky_tag_hourly": (
+        ("tag", "LowCardinality(String)"),
+        ("hour", "DateTime('UTC')"),
+        ("posts", "UInt64"),
+    ),
+}
+
+
 class RadarSource(Protocol):
     def steam_players(self, appids: Sequence[str], since: datetime) -> dict[str, dict[datetime, int]]: ...
     def steam_chart(self, appids: Sequence[str], since: datetime) -> SteamChart: ...
@@ -25,21 +38,20 @@ class RadarSource(Protocol):
     ) -> dict[str, dict[datetime, int]]: ...
 
 
-PLAYERS_SQL: str = """SELECT entity_id, observed_at, value FROM {db}.observations FINAL
-WHERE source = 'steam' AND entity_type = 'game' AND metric = 'players_current'
-  AND has({{appids:Array(String)}}, entity_id) AND observed_at >= {{since:DateTime64(6, 'UTC')}}"""
-CHART_DAYS_SQL: str = """SELECT DISTINCT observed_at FROM {db}.observations
-WHERE source = 'steam' AND entity_type = 'game' AND metric = 'chart_rank'
-  AND observed_at >= {{since:DateTime64(6, 'UTC')}}
-ORDER BY observed_at DESC LIMIT 2"""
-CHART_RANKS_SQL: str = """SELECT entity_id, observed_at, toInt32(value) AS rank FROM {db}.observations FINAL
-WHERE source = 'steam' AND entity_type = 'game' AND metric = 'chart_rank'
-  AND has({{days:Array(DateTime64(6, 'UTC'))}}, observed_at) AND has({{appids:Array(String)}}, entity_id)"""
-TAGS_SQL: str = """SELECT substring(metric, 5) AS tag, toStartOfHour(window_start) AS hour, count() AS posts
-FROM {db}.observations FINAL
-WHERE source = 'bluesky' AND entity_type = 'post' AND has({{metrics:Array(String)}}, metric)
-  AND window_start >= {{since:DateTime64(6, 'UTC')}} AND window_start < {{until:DateTime64(6, 'UTC')}}
-GROUP BY tag, hour"""
+PLAYERS_SQL: str = """SELECT appid, observed_at, players FROM {db}.steam_players
+WHERE has({{appids:Array(String)}}, appid) AND observed_at >= {{since:DateTime64(6, 'UTC')}}"""
+CHART_DAYS_SQL: str = """SELECT DISTINCT chart_day FROM {db}.steam_chart
+WHERE chart_day >= {{since:DateTime64(6, 'UTC')}}
+ORDER BY chart_day DESC LIMIT 2"""
+CHART_RANKS_SQL: str = """SELECT appid, chart_day, rank FROM {db}.steam_chart
+WHERE has({{days:Array(DateTime64(6, 'UTC'))}}, chart_day) AND has({{appids:Array(String)}}, appid)"""
+TAGS_SQL: str = """SELECT tag, hour, posts FROM {db}.bluesky_tag_hourly
+WHERE has({{tags:Array(String)}}, tag)
+  AND hour >= {{since:DateTime64(6, 'UTC')}} AND hour < {{until:DateTime64(6, 'UTC')}}"""
+
+
+def _columns(columns: Sequence[tuple[str, str]]) -> str:
+    return ", ".join(f"{name} {kind}" for name, kind in columns)
 
 
 def _moment(value: datetime) -> str:
@@ -98,6 +110,34 @@ class ClickHouseRadar:
             rows.append(parsed)
         return rows
 
+    def contract_problems(self) -> list[str]:
+        """Compare DESCRIBE TABLE of each view with CONTRACT_COLUMNS; an empty list means it matches."""
+        problems: list[str] = []
+        view: str
+        expected: tuple[tuple[str, str], ...]
+        for view, expected in CONTRACT_COLUMNS.items():
+            name: str = f"{self._database}.{view}"
+            try:
+                rows: list[dict[str, object]] = self.select(f"DESCRIBE TABLE {name}", {})
+            except RadarError as exc:
+                problems.append(f"{name}: {exc}")
+                continue
+            actual: list[tuple[str, str]] = []
+            row: dict[str, object]
+            for row in rows:
+                column: object = row.get("name")
+                kind: object = row.get("type")
+                if isinstance(column, str) and isinstance(kind, str):
+                    actual.append((column, kind))
+                else:
+                    break
+            else:
+                if actual != list(expected):
+                    problems.append(f"{name}: expected {_columns(expected)}, got {_columns(actual)}")
+                continue
+            problems.append(f"{name}: unexpected DESCRIBE answer")
+        return problems
+
     def _read(self, sql: str, params: Mapping[str, str]) -> list[dict[str, object]]:
         return self.select(sql.format(db=self._database), params)
 
@@ -111,12 +151,10 @@ class ClickHouseRadar:
         row: dict[str, object]
         try:
             for row in rows:
-                entity_id: object = row["entity_id"]
-                if not isinstance(entity_id, str):
-                    raise ValueError("entity_id")
-                result.setdefault(entity_id, {})[_parse_moment(row["observed_at"])] = int(
-                    float(str(row["value"]))
-                )
+                appid: object = row["appid"]
+                if not isinstance(appid, str):
+                    raise ValueError("appid")
+                result.setdefault(appid, {})[_parse_moment(row["observed_at"])] = int(str(row["players"]))
         except KeyError, ValueError, TypeError:
             raise RadarError("ClickHouse answer did not parse") from None
         return result
@@ -125,7 +163,7 @@ class ClickHouseRadar:
         day_rows: list[dict[str, object]] = self._read(CHART_DAYS_SQL, {"since": _moment(since)})
         try:
             days: tuple[datetime, ...] = tuple(
-                sorted((_parse_moment(row["observed_at"]) for row in day_rows), reverse=True)
+                sorted((_parse_moment(row["chart_day"]) for row in day_rows), reverse=True)
             )
         except KeyError, ValueError, TypeError:
             raise RadarError("ClickHouse answer did not parse") from None
@@ -142,10 +180,10 @@ class ClickHouseRadar:
         row: dict[str, object]
         try:
             for row in rows:
-                entity_id: object = row["entity_id"]
-                if not isinstance(entity_id, str):
-                    raise ValueError("entity_id")
-                ranks[_parse_moment(row["observed_at"])][entity_id] = int(str(row["rank"]))
+                appid: object = row["appid"]
+                if not isinstance(appid, str):
+                    raise ValueError("appid")
+                ranks[_parse_moment(row["chart_day"])][appid] = int(str(row["rank"]))
         except KeyError, ValueError, TypeError:
             raise RadarError("ClickHouse answer did not parse") from None
         return SteamChart(days=days, ranks=ranks)
@@ -158,7 +196,7 @@ class ClickHouseRadar:
         rows: list[dict[str, object]] = self._read(
             TAGS_SQL,
             {
-                "metrics": _array([f"tag_{tag}" for tag in tags]),
+                "tags": _array(tags),
                 "since": _moment(since),
                 "until": _moment(until),
             },
@@ -174,3 +212,13 @@ class ClickHouseRadar:
         except KeyError, ValueError, TypeError:
             raise RadarError("ClickHouse answer did not parse") from None
         return result
+
+
+def clickhouse_from_settings() -> ClickHouseRadar:
+    return ClickHouseRadar(
+        httpx.Client(timeout=30.0),
+        url=settings.CLICKHOUSE_URL,
+        user=settings.CLICKHOUSE_USER,
+        password=settings.CLICKHOUSE_PASSWORD,
+        database=settings.CLICKHOUSE_DATABASE,
+    )

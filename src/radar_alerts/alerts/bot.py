@@ -99,3 +99,19 @@ def poll_once(telegram: Telegram, now: datetime) -> int:
             cursor.offset = max(_update_id(u) for u in fresh) + 1
             cursor.save(update_fields=["offset"])
         return len(fresh)
+
+
+def accept_update(update: Mapping[str, object], now: datetime) -> Reply | None:
+    """Handle one update exactly once: a repeat (update_id below the cursor) is dropped."""
+    update_id: object = update.get("update_id")
+    if not isinstance(update_id, int) or isinstance(update_id, bool):
+        return None
+    with transaction.atomic():
+        BotCursor.objects.get_or_create(pk=1)
+        cursor: BotCursor = BotCursor.objects.select_for_update().get(pk=1)
+        if update_id < cursor.offset:
+            return None
+        reply: Reply | None = handle_update(update, now)
+        cursor.offset = update_id + 1
+        cursor.save(update_fields=["offset"])
+        return reply

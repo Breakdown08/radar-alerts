@@ -69,3 +69,43 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --locked
       - run: uv run pytest -m clickhouse
+
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare .env and the fake Telegram
+        run: |
+          cp .env.example .env
+          sed -i -e 's/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=ci-db-password/' \
+                 -e 's/^RABBITMQ_PASSWORD=.*/RABBITMQ_PASSWORD=ci-mq-password/' \
+                 -e 's/^DJANGO_SECRET_KEY=.*/DJANGO_SECRET_KEY=ci-secret-key/' \
+                 -e 's/^TELEGRAM_BOT_TOKEN=.*/TELEGRAM_BOT_TOKEN=123456:ci-fake-token/' \
+                 -e 's#^TELEGRAM_API_URL=.*#TELEGRAM_API_URL=http://telegram-stub:8081#' .env
+          docker network create gamedev-trends_default
+          docker run -d --name telegram-stub --network gamedev-trends_default \
+                 -v "$PWD/tests/telegram_stub.py:/stub.py:ro" python:3.14.7-slim-trixie python /stub.py
+      - name: Bring the stack up
+        run: docker compose up -d --build --wait --wait-timeout 240
+      - name: Check web, static and users
+        run: |
+          curl -fsS http://127.0.0.1:8000/healthz
+          curl -fsS -o /dev/null http://127.0.0.1:8000/static/admin/css/base.css
+          test "$(docker compose exec -T web id -u)" != "0"
+          test "$(docker compose exec -T worker id -u)" != "0"
+          docker compose exec -T web python manage.py check
+      - name: Check the logs for secrets
+        run: |
+          sleep 30  # beat queues 2-3 bot polls with the fake token
+          docker compose logs --no-color > compose.log
+          grep -q "polling Telegram failed" compose.log
+          docker logs telegram-stub 2>&1 | grep -q "/getUpdates"
+          ! grep -F -e ci-db-password -e ci-mq-password -e ci-secret-key -e ci-fake-token compose.log
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose logs --no-color
+      - name: Tear down
+        if: always()
+        run: |
+          docker rm -f telegram-stub
+          docker compose down -v

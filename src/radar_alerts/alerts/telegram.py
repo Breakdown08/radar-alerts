@@ -1,6 +1,7 @@
 from typing import Protocol
 
 import httpx
+from django.conf import settings
 
 
 class TelegramError(Exception):
@@ -90,3 +91,22 @@ class HttpTelegram:
         if not isinstance(result, list):
             raise TelegramError("Telegram answered 200 without a result list", retryable=False)
         return [item for item in result if isinstance(item, dict)]
+
+    def set_webhook(self, url: str, secret_token: str) -> None:
+        self._call("setWebhook", {"url": url, "secret_token": secret_token, "allowed_updates": ["message"]})
+
+    def delete_webhook(self) -> None:
+        self._call("deleteWebhook", {})
+
+    def webhook_info(self) -> dict[str, object]:
+        result: object = self._call("getWebhookInfo", {})
+        if not isinstance(result, dict):
+            raise TelegramError("Telegram answered 200 without a result object", retryable=False)
+        return result
+
+
+def http_telegram_from_settings() -> HttpTelegram | None:
+    token: str = settings.TELEGRAM_BOT_TOKEN
+    if not token:
+        return None
+    return HttpTelegram(httpx.Client(timeout=10.0), token, settings.TELEGRAM_API_URL)

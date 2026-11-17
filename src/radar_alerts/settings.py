@@ -45,6 +45,7 @@ INSTALLED_APPS: list[str] = [
 
 MIDDLEWARE: list[str] = [
     "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -99,6 +100,7 @@ USE_TZ: bool = True
 TIME_ZONE: str = "UTC"
 LANGUAGE_CODE: str = "en-us"
 STATIC_URL: str = "static/"
+STATIC_ROOT: Path = BASE_DIR / "staticfiles"
 DEFAULT_AUTO_FIELD: str = "django.db.models.BigAutoField"
 
 REST_FRAMEWORK: dict[str, object] = {
@@ -125,15 +127,6 @@ CELERY_TASK_ACKS_LATE: bool = True
 CELERY_WORKER_PREFETCH_MULTIPLIER: int = 1
 CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP: bool = True
 CELERY_TIMEZONE: str = "UTC"
-CELERY_BEAT_SCHEDULE: dict[str, dict[str, object]] = {
-    "check-rules": {"task": "radar_alerts.alerts.tasks.check_rules", "schedule": 300.0},
-    "poll-telegram": {
-        "task": "radar_alerts.alerts.tasks.poll_telegram",
-        "schedule": 10.0,
-        "options": {"expires": 9},
-    },
-}
-
 # httpx logs every request URL at INFO, and a Bot API URL carries the token
 # (https://api.telegram.org/bot<token>/...): keep those loggers at WARNING.
 LOGGING: dict[str, object] = {
@@ -149,8 +142,53 @@ TELEGRAM_BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_BOT_USERNAME: str = os.environ.get("TELEGRAM_BOT_USERNAME", "").lstrip("@")
 
 CLICKHOUSE_URL: str = os.environ.get("CLICKHOUSE_URL", "http://localhost:8123").rstrip("/")
-CLICKHOUSE_USER: str = os.environ.get("CLICKHOUSE_USER", "radar")
+CLICKHOUSE_USER: str = os.environ.get("CLICKHOUSE_USER", "radar_alerts")
 CLICKHOUSE_PASSWORD: str = os.environ.get("CLICKHOUSE_PASSWORD", "")
-CLICKHOUSE_DATABASE: str = os.environ.get("CLICKHOUSE_DATABASE", "radar")
+CLICKHOUSE_DATABASE: str = os.environ.get("CLICKHOUSE_DATABASE", "alerts_v1")
 if not re.fullmatch(r"[a-z_][a-z0-9_]{0,63}", CLICKHOUSE_DATABASE):
     raise ImproperlyConfigured(f"CLICKHOUSE_DATABASE: invalid name {CLICKHOUSE_DATABASE!r}")
+
+
+WEBHOOK_SECRET_RE: re.Pattern[str] = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
+
+
+def telegram_mode(mode: str, secret: str) -> str:
+    """'polling' for '' or 'polling'; 'webhook' if secret matches WEBHOOK_SECRET_RE.
+    Otherwise ImproperlyConfigured (the message never contains the secret)."""
+    if mode in ("", "polling"):
+        return "polling"
+    if mode != "webhook":
+        raise ImproperlyConfigured("TELEGRAM_MODE: value not allowed (polling or webhook)")
+    if not WEBHOOK_SECRET_RE.match(secret):
+        raise ImproperlyConfigured("TELEGRAM_WEBHOOK_SECRET must be 1-256 characters of [A-Za-z0-9_-]")
+    return "webhook"
+
+
+def telegram_api_url(value: str) -> str:
+    """'' -> 'https://api.telegram.org'; http(s) URL -> it without the trailing '/'."""
+    if not value:
+        return "https://api.telegram.org"
+    if not value.startswith(("http://", "https://")):
+        raise ImproperlyConfigured("TELEGRAM_API_URL must start with http:// or https://")
+    return value.rstrip("/")
+
+
+def beat_schedule(mode: str) -> dict[str, dict[str, object]]:
+    """check-rules always; poll-telegram only for mode == 'polling'."""
+    schedule: dict[str, dict[str, object]] = {
+        "check-rules": {"task": "radar_alerts.alerts.tasks.check_rules", "schedule": 300.0},
+    }
+    if mode == "polling":
+        schedule["poll-telegram"] = {
+            "task": "radar_alerts.alerts.tasks.poll_telegram",
+            "schedule": 10.0,
+            "options": {"expires": 9},
+        }
+    return schedule
+
+
+TELEGRAM_WEBHOOK_SECRET: str = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
+TELEGRAM_MODE: str = telegram_mode(os.environ.get("TELEGRAM_MODE", ""), TELEGRAM_WEBHOOK_SECRET)
+TELEGRAM_WEBHOOK_URL: str = os.environ.get("TELEGRAM_WEBHOOK_URL", "").rstrip("/")
+TELEGRAM_API_URL: str = telegram_api_url(os.environ.get("TELEGRAM_API_URL", ""))
+CELERY_BEAT_SCHEDULE: dict[str, dict[str, object]] = beat_schedule(TELEGRAM_MODE)

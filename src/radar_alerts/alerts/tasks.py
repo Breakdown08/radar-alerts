@@ -1,11 +1,12 @@
 import logging
 from datetime import datetime
 
-import httpx
 from celery import Task, shared_task
+from celery.signals import worker_ready
 from django.conf import settings
 from django.utils import timezone
 
+from radar_alerts.alerts import radar, telegram
 from radar_alerts.alerts.bot import poll_once
 from radar_alerts.alerts.checking import run_check, stale_pending
 from radar_alerts.alerts.delivery import (
@@ -15,27 +16,18 @@ from radar_alerts.alerts.delivery import (
     deliver_once,
     mark_failed,
 )
-from radar_alerts.alerts.radar import ClickHouseRadar, RadarSource
-from radar_alerts.alerts.telegram import HttpTelegram, Telegram, TelegramError
+from radar_alerts.alerts.radar import CONTRACT_VERSION, RadarError, RadarSource
+from radar_alerts.alerts.telegram import Telegram, TelegramError
 
 logger: logging.Logger = logging.getLogger(__name__)
 
 
 def get_radar() -> RadarSource:
-    return ClickHouseRadar(
-        httpx.Client(timeout=30.0),
-        url=settings.CLICKHOUSE_URL,
-        user=settings.CLICKHOUSE_USER,
-        password=settings.CLICKHOUSE_PASSWORD,
-        database=settings.CLICKHOUSE_DATABASE,
-    )
+    return radar.clickhouse_from_settings()
 
 
 def get_telegram() -> Telegram | None:
-    token: str = settings.TELEGRAM_BOT_TOKEN
-    if not token:
-        return None
-    return HttpTelegram(httpx.Client(timeout=10.0), token)
+    return telegram.http_telegram_from_settings()
 
 
 @shared_task
@@ -63,11 +55,33 @@ def deliver_firing(self: Task[[int], str], firing_id: int) -> str:
 
 @shared_task
 def poll_telegram() -> int:
-    telegram: Telegram | None = get_telegram()
-    if telegram is None:
+    if settings.TELEGRAM_MODE == "webhook":
+        return 0
+    client: Telegram | None = get_telegram()
+    if client is None:
         return 0
     try:
-        return poll_once(telegram, timezone.now())
+        return poll_once(client, timezone.now())
     except TelegramError as exc:
         logger.warning("polling Telegram failed: %s", exc)
         return 0
+
+
+def log_contract_status() -> None:
+    """INFO 'radar contract v1 in <db>: ok', or one ERROR per problem. Never raises RadarError."""
+    database: str = settings.CLICKHOUSE_DATABASE
+    try:
+        problems: list[str] = radar.clickhouse_from_settings().contract_problems()
+    except RadarError as exc:
+        problems = [str(exc)]
+    if not problems:
+        logger.info("radar contract v%d in %s: ok", CONTRACT_VERSION, database)
+        return
+    problem: str
+    for problem in problems:
+        logger.error("radar contract v%d in %s: %s", CONTRACT_VERSION, database, problem)
+
+
+@worker_ready.connect
+def _on_worker_ready(**kwargs: object) -> None:
+    log_contract_status()
