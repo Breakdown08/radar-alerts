@@ -9,7 +9,14 @@ from radar_alerts.alerts.users import current_user
 from radar_alerts.alerts.validation import check_rule, normalize_entity_id
 
 TARGET_FIELDS: tuple[str, ...] = ("source", "entity_type", "entity_id")
+DUPLICATE_MESSAGE: str = "You are already subscribed to this target."
 CHANGE_MESSAGE: str = "The target of a subscription cannot be changed after creation."
+
+
+def target_taken(user: User, source: str, entity_type: str, entity_id: str) -> bool:
+    return Subscription.objects.filter(
+        user=user, source=source, entity_type=entity_type, entity_id=entity_id
+    ).exists()
 
 
 def _django_errors(exc: DjangoValidationError) -> serializers.ValidationError:
@@ -60,8 +67,13 @@ class SubscriptionSerializer(serializers.ModelSerializer[Subscription]):
         if current is not None:
             if merged["entity_id"] != current.entity_id:
                 raise serializers.ValidationError({"entity_id": [CHANGE_MESSAGE]})
-        elif Subscription.objects.filter(user=current_user(self.context["request"]), **merged).exists():
-            raise serializers.ValidationError("You are already subscribed to this target.")
+        elif target_taken(
+            current_user(self.context["request"]),
+            merged["source"],
+            merged["entity_type"],
+            merged["entity_id"],
+        ):
+            raise serializers.ValidationError(DUPLICATE_MESSAGE)
         attrs["entity_id"] = merged["entity_id"]
         return attrs
 

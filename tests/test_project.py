@@ -14,6 +14,9 @@ def test_migrations_match_models() -> None:
         "User",
         "Subscription",
         "Rule",
+        "Firing",
+        "LinkCode",
+        "BotCursor",
     }
     call_command("makemigrations", "--check", "--dry-run")
 

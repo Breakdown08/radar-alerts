@@ -1,7 +1,8 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin
+from django.http import HttpRequest
 
-from radar_alerts.alerts.models import Rule, Subscription, User
+from radar_alerts.alerts.models import Firing, Rule, Subscription, User
 
 
 @admin.register(User)
@@ -37,3 +38,15 @@ class SubscriptionAdmin(admin.ModelAdmin[Subscription]):
 class RuleAdmin(admin.ModelAdmin[Rule]):
     list_display = ("id", "subscription", "kind", "threshold", "window_hours", "is_active")
     list_filter = ("kind", "is_active")
+
+
+@admin.register(Firing)
+class FiringAdmin(admin.ModelAdmin[Firing]):
+    list_display = ("id", "rule", "period", "status", "attempts", "sent_at", "created_at")
+    list_filter = ("status",)
+
+    def has_add_permission(self, request: HttpRequest) -> bool:
+        return False
+
+    def has_change_permission(self, request: HttpRequest, obj: Firing | None = None) -> bool:
+        return False

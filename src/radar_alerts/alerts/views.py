@@ -1,15 +1,24 @@
 from collections.abc import Callable
 from typing import Any
 
+from django.conf import settings
+from django.db import IntegrityError, transaction
 from django.db.models import QuerySet
+from django.utils import timezone
 from rest_framework import serializers, viewsets
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from radar_alerts.alerts.models import EntityType, Rule, RuleKind, Source, Subscription
-from radar_alerts.alerts.serializers import MeSerializer, RuleSerializer, SubscriptionSerializer
+from radar_alerts.alerts.bot import issue_link_code
+from radar_alerts.alerts.models import EntityType, LinkCode, Rule, RuleKind, Source, Subscription, User
+from radar_alerts.alerts.serializers import (
+    DUPLICATE_MESSAGE,
+    MeSerializer,
+    RuleSerializer,
+    SubscriptionSerializer,
+)
 from radar_alerts.alerts.users import current_user
 
 
@@ -62,6 +71,29 @@ class MeView(APIView):
         return Response(MeSerializer(current_user(request)).data)
 
 
+class TelegramLinkView(APIView):
+    permission_classes = (IsAuthenticated,)
+
+    def post(self, request: Request) -> Response:
+        link: LinkCode = issue_link_code(current_user(request), timezone.now())
+        username: str = settings.TELEGRAM_BOT_USERNAME
+        return Response(
+            {
+                "code": link.code,
+                "expires_at": link.expires_at.isoformat(),
+                "deep_link": f"https://t.me/{username}?start={link.code}" if username else None,
+            },
+            status=201,
+        )
+
+    def delete(self, request: Request) -> Response:
+        user: User = current_user(request)
+        with transaction.atomic():
+            LinkCode.objects.filter(user=user).delete()
+            User.objects.filter(pk=user.pk).update(telegram_chat_id=None)
+        return Response(status=204)
+
+
 class SubscriptionViewSet(viewsets.ModelViewSet[Subscription]):
     serializer_class = SubscriptionSerializer
 
@@ -81,7 +113,20 @@ class SubscriptionViewSet(viewsets.ModelViewSet[Subscription]):
         )
 
     def perform_create(self, serializer: serializers.BaseSerializer[Subscription]) -> None:
-        serializer.save(user=current_user(self.request))
+        user: User = current_user(self.request)
+        try:
+            with transaction.atomic():
+                serializer.save(user=user)
+        except IntegrityError:
+            data: dict[str, Any] = serializer.validated_data
+            if Subscription.objects.filter(
+                user=user,
+                source=data["source"],
+                entity_type=data["entity_type"],
+                entity_id=data["entity_id"],
+            ).exists():
+                raise serializers.ValidationError({"non_field_errors": [DUPLICATE_MESSAGE]}) from None
+            raise
 
 
 class RuleViewSet(viewsets.ModelViewSet[Rule]):

@@ -1,6 +1,7 @@
 import os
 import re
 from pathlib import Path
+from urllib.parse import quote
 
 import django_stubs_ext
 from django.core.exceptions import ImproperlyConfigured
@@ -106,3 +107,39 @@ REST_FRAMEWORK: dict[str, object] = {
     "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"],
     "DEFAULT_PAGINATION_CLASS": "radar_alerts.alerts.pagination.Pagination",
 }
+
+
+def amqp_url(user: str, password: str, host: str, port: str) -> str:
+    """amqp://user:password@host:port// with user and password percent-encoded."""
+    return f"amqp://{quote(user, safe='')}:{quote(password, safe='')}@{host}:{port}//"
+
+
+RABBITMQ_HOST: str = os.environ.get("RABBITMQ_HOST", "localhost")
+RABBITMQ_PORT: str = os.environ.get("RABBITMQ_PORT", "5672")
+RABBITMQ_USER: str = os.environ.get("RABBITMQ_USER", "radar_alerts")
+RABBITMQ_PASSWORD: str = os.environ.get("RABBITMQ_PASSWORD", "")
+
+CELERY_BROKER_URL: str = amqp_url(RABBITMQ_USER, RABBITMQ_PASSWORD, RABBITMQ_HOST, RABBITMQ_PORT)
+CELERY_TASK_IGNORE_RESULT: bool = True
+CELERY_TASK_ACKS_LATE: bool = True
+CELERY_WORKER_PREFETCH_MULTIPLIER: int = 1
+CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP: bool = True
+CELERY_TIMEZONE: str = "UTC"
+CELERY_BEAT_SCHEDULE: dict[str, dict[str, object]] = {
+    "check-rules": {"task": "radar_alerts.alerts.tasks.check_rules", "schedule": 300.0},
+    "poll-telegram": {
+        "task": "radar_alerts.alerts.tasks.poll_telegram",
+        "schedule": 10.0,
+        "options": {"expires": 9},
+    },
+}
+
+TELEGRAM_BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_BOT_USERNAME: str = os.environ.get("TELEGRAM_BOT_USERNAME", "").lstrip("@")
+
+CLICKHOUSE_URL: str = os.environ.get("CLICKHOUSE_URL", "http://localhost:8123").rstrip("/")
+CLICKHOUSE_USER: str = os.environ.get("CLICKHOUSE_USER", "radar")
+CLICKHOUSE_PASSWORD: str = os.environ.get("CLICKHOUSE_PASSWORD", "")
+CLICKHOUSE_DATABASE: str = os.environ.get("CLICKHOUSE_DATABASE", "radar")
+if not re.fullmatch(r"[a-z_][a-z0-9_]{0,63}", CLICKHOUSE_DATABASE):
+    raise ImproperlyConfigured(f"CLICKHOUSE_DATABASE: invalid name {CLICKHOUSE_DATABASE!r}")

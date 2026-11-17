@@ -10,10 +10,13 @@ dependencies = [
     "djangorestframework>=3.18",
     "django-stubs-ext>=6.1",
     "psycopg[binary]>=3.2",
+    "celery>=5.7,<6",
+    "httpx>=0.28",
 ]
 
 [dependency-groups]
 dev = [
+    "celery-types>=0.26",
     "django-stubs[compatible-mypy]>=6.1",
     "djangorestframework-stubs[compatible-mypy]>=3.18",
     "pytest>=8",
@@ -49,4 +52,7 @@ django_settings_module = "radar_alerts.settings"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 DJANGO_SETTINGS_MODULE = "radar_alerts.settings"
-markers = ["postgres: needs PostgreSQL; skipped on SQLite"]
+markers = [
+    "postgres: needs PostgreSQL; skipped on SQLite",
+    "clickhouse: needs a live ClickHouse (CLICKHOUSE_TEST_URL); skipped otherwise",
+]

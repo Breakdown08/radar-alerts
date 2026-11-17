@@ -44,3 +44,28 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --locked
       - run: uv run pytest
+
+  clickhouse:
+    runs-on: ubuntu-latest
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:26.8.36.3
+        env:
+          CLICKHOUSE_USER: radar
+          CLICKHOUSE_PASSWORD: ci-password
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "wget -qO- http://localhost:8123/ping || exit 1"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      CLICKHOUSE_TEST_URL: http://localhost:8123
+      CLICKHOUSE_TEST_USER: radar
+      CLICKHOUSE_TEST_PASSWORD: ci-password
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked
+      - run: uv run pytest -m clickhouse

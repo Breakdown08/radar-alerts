@@ -94,3 +94,45 @@ class Rule(models.Model):
     def __str__(self) -> str:
         window: str = f" / {self.window_hours}h" if self.window_hours is not None else ""
         return f"{self.kind} {self.threshold:.2f}{window}"
+
+
+class FiringStatus(models.TextChoices):
+    PENDING = "pending"
+    SENDING = "sending"
+    RETRY = "retry"
+    SENT = "sent"
+    FAILED = "failed"
+
+
+class Firing(models.Model):
+    rule: models.ForeignKey[Rule, Rule] = models.ForeignKey(
+        Rule, on_delete=models.CASCADE, related_name="firings"
+    )
+    period: models.DateTimeField[datetime, datetime] = models.DateTimeField()
+    text: models.TextField[str, str] = models.TextField()
+    status: models.CharField[str, str] = models.CharField(
+        max_length=16, choices=FiringStatus.choices, default=FiringStatus.PENDING
+    )
+    attempts: models.PositiveSmallIntegerField[int, int] = models.PositiveSmallIntegerField(default=0)
+    last_error: models.TextField[str, str] = models.TextField(blank=True, default="")
+    telegram_message_id: models.BigIntegerField[int | None, int | None] = models.BigIntegerField(null=True)
+    created_at: models.DateTimeField[datetime, datetime] = models.DateTimeField(auto_now_add=True)
+    sent_at: models.DateTimeField[datetime | None, datetime | None] = models.DateTimeField(null=True)
+
+    class Meta:
+        ordering = ["-id"]
+        constraints = [models.UniqueConstraint(fields=["rule", "period"], name="firing_unique_period")]
+        indexes = [models.Index(fields=["status", "created_at"], name="firing_status_idx")]
+
+
+class LinkCode(models.Model):
+    user: models.ForeignKey[User, User] = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name="link_codes"
+    )
+    code: models.CharField[str, str] = models.CharField(max_length=64, unique=True)
+    expires_at: models.DateTimeField[datetime, datetime] = models.DateTimeField()
+    created_at: models.DateTimeField[datetime, datetime] = models.DateTimeField(auto_now_add=True)
+
+
+class BotCursor(models.Model):
+    offset: models.BigIntegerField[int, int] = models.BigIntegerField(default=0)
