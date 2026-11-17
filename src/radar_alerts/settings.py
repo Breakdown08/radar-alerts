@@ -134,6 +134,17 @@ CELERY_BEAT_SCHEDULE: dict[str, dict[str, object]] = {
     },
 }
 
+# httpx logs every request URL at INFO, and a Bot API URL carries the token
+# (https://api.telegram.org/bot<token>/...): keep those loggers at WARNING.
+LOGGING: dict[str, object] = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "loggers": {
+        "httpx": {"level": "WARNING"},
+        "httpcore": {"level": "WARNING"},
+    },
+}
+
 TELEGRAM_BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_BOT_USERNAME: str = os.environ.get("TELEGRAM_BOT_USERNAME", "").lstrip("@")
 
