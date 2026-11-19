@@ -10,8 +10,11 @@ scheduler. Its only dependency on the radar is a versioned read-only SQL interfa
 
 ## What is not there yet
 
-- **No TLS and no reverse proxy.** The service listens on `127.0.0.1:8000`. The Telegram webhook is checked by tests
-  and locally with a forged update, not live through Telegram.
+- **No TLS.** nginx listens on `127.0.0.1:${HTTP_PORT:-8080}` over plain HTTP. TLS would end in the same nginx:
+  a `server` with `listen 443 ssl` and certificates (for example from certbot), `listen 80` only for a redirect,
+  and HSTS. Django would then turn on `SECURE_SSL_REDIRECT`, `SESSION_COOKIE_SECURE` and `CSRF_COOKIE_SECURE`;
+  `SECURE_PROXY_SSL_HEADER` is already set. The Telegram webhook is checked by tests and locally with a forged
+  update, not live through Telegram.
 - **Missed checks are not caught up.** Every check looks only at the latest period. If the worker was down for
   three hours, transitions inside those hours are not reported.
 - **Steam growth assumes the collector polls hourly** (the radar's default `STEAM_POLL_INTERVAL_SECONDS=3600`).
@@ -77,17 +80,23 @@ docker compose exec web python manage.py createsuperuser
 docker compose exec worker python manage.py check_radar_contract
 ```
 
-`docker compose up -d --build --wait` starts `db`, `rabbitmq`, `migrate`, `web`, `worker` and `beat` in their
+`docker compose up -d --build --wait` starts `db`, `rabbitmq`, `migrate`, `web`, `worker`, `beat` and `nginx` in their
 own network. `migrate` is a one-shot container: it applies migrations and exits, and `web`, `worker` and `beat`
 start only after it finished successfully, so no two processes migrate at once. `web` is gunicorn
-(`WEB_CONCURRENCY` sets the number of its workers) with static files served by whitenoise.
+(`WEB_CONCURRENCY` sets the number of its workers) with static files served by whitenoise behind nginx.
+
+- `nginx` is the only service published on the host (`127.0.0.1:${HTTP_PORT:-8080}`). It proxies to `web:8000`,
+  passes `Host` and `X-Forwarded-For/Proto`, sets security headers and gzip. The config is `deploy/nginx.conf`.
+  `web` has no published port. `nginx` depends on `web` with `restart: true`, so recreating `web` restarts
+  `nginx` too (it resolves `web` once, at start). In the compose stack the API is at `localhost:8080`.
 
 - Only `worker` talks to the radar's ClickHouse. It joins the radar's external docker network, named by
   `RADAR_DOCKER_NETWORK` (default `gamedev-trends_default`), and reaches ClickHouse at `DOCKER_CLICKHOUSE_URL`
   (default `http://clickhouse:8123`). If the radar was never started, the network does not exist and
   `docker compose up` refuses: create it with `docker network create gamedev-trends_default`. The stack then
   runs without the radar and `check_rules` logs `RadarError`.
-- Health checks: `db`, `rabbitmq`, `web` (`/healthz`, which checks only the database) and `worker`
+- Health checks: `db`, `rabbitmq`, `web` (`/healthz`, which checks only the database), `nginx` (`/healthz`
+  through the proxy) and `worker`
   (`celery inspect ping`). `beat` has none: it listens on nothing, and a check by the age of its schedule file
   is fragile. `restart: unless-stopped` revives it; look for `Scheduler: Sending due task` in its log.
 - `beat` must run as exactly one instance. `worker` can be scaled: `docker compose up -d --scale worker=2`.
@@ -95,6 +104,13 @@ start only after it finished successfully, so no two processes migrate at once. 
 - `DJANGO_ALLOWED_HOSTS` must contain `localhost`, otherwise the `web` health check gets 400.
 - `db` and `rabbitmq` are also published on `127.0.0.1`, so development on the host with `uv run` (see Run)
   still works.
+
+## Errors (Sentry)
+
+With `SENTRY_DSN` set, unhandled exceptions of Django requests and Celery tasks go to Sentry, with
+`SENTRY_ENVIRONMENT` (default `production`) and `SENTRY_RELEASE`. Not sent: personal data, local variables of
+stack frames, and HTTP requests of httpx, because a Bot API URL contains the bot token. Traces are off unless
+`SENTRY_TRACES_SAMPLE_RATE` (0 to 1) is raised. Without `SENTRY_DSN` the SDK is not started at all.
 
 ## Radar interface
 
@@ -149,6 +165,9 @@ Memory (`docker stats --no-stream`): `worker` 157 MiB with `WORKER_CONCURRENCY=2
 76 MiB, `beat` 72 MiB, `db` 26 MiB. Before the limit the worker ran Celery's default of one prefork process per
 CPU, 22 here, and took 1009 MiB.
 
+`nginx` in front of `web` (added 2026-11-19): 17.5 MiB in `docker stats --no-stream`; `nginx -t` passes in the
+container, and after `docker compose up -d --force-recreate --no-deps web` the proxy answers 200 again without a restart.
+
 Checked by hand in the same run: the `radar_alerts` user gets `ACCESS_DENIED` on `radar.observations` and on
 `CREATE TABLE`; with a wrong `CLICKHOUSE_DATABASE` `check_radar_contract` exits with 1, the worker logs ERROR
 and the bot still answers `/start`; no value of `TELEGRAM_BOT_TOKEN`, `CLICKHOUSE_PASSWORD`,
@@ -179,6 +198,8 @@ All paths except the token need `Authorization: Token <key>`. Lists are paginate
 Targets: `steam`/`game` with an appid, `bluesky`/`tag` with a tag from the whitelist (`#GameDev` becomes `gamedev`).
 Rules: `growth_pct` (threshold 0..10000, `window_hours` 1..168) and `top_n` (whole threshold; Steam: 1..100 and no
 window; Bluesky: 1..number of tags minus one and `window_hours` 1..168).
+
+The examples use `runserver` (`localhost:8000`); in the compose stack the address is `localhost:8080`.
 
 ```
 curl -s -X POST localhost:8000/api/v1/auth/token/ -d username=alice -d password=...
@@ -213,10 +234,14 @@ curl -s -H "Authorization: Token $TOKEN" -H "Content-Type: application/json" \
 | `TELEGRAM_WEBHOOK_SECRET` | empty | required for `webhook`: 1-256 characters of `[A-Za-z0-9_-]` |
 | `TELEGRAM_WEBHOOK_URL` | empty | public `https://` base URL, used by `telegram_webhook set` |
 | `TELEGRAM_API_URL` | `https://api.telegram.org` | Bot API base URL; changed only in CI, to a fake Telegram |
-| `WEB_PORT` | `8000` | compose only: web port on `127.0.0.1` |
+| `HTTP_PORT` | `8080` | compose only: nginx port on `127.0.0.1` |
 | `WORKER_CONCURRENCY` | `2` | compose only: Celery worker processes (Celery's own default is one per CPU) |
 | `DOCKER_CLICKHOUSE_URL` | `http://clickhouse:8123` | compose only: `CLICKHOUSE_URL` inside `worker` |
 | `RADAR_DOCKER_NETWORK` | `gamedev-trends_default` | compose only: the radar's external docker network |
+| `SENTRY_DSN` | empty | empty means Sentry is off |
+| `SENTRY_ENVIRONMENT` | `production` | |
+| `SENTRY_RELEASE` | empty | the SDK may detect it itself |
+| `SENTRY_TRACES_SAMPLE_RATE` | `0` | from 0 to 1 |
 | `RADAR_BLUESKY_TAGS` | `gamedev,indiedev,indiegame,godot,pixelart,screenshotsaturday,mobilegame` | tags the radar collects |
 
 ## Development
@@ -227,7 +252,7 @@ uv run ruff check && uv run ruff format --check && uv run ty check && uv run myp
 ```
 
 Tests run on SQLite by default; with `POSTGRES_*` set the whole suite runs on PostgreSQL.
-Do not set `RADAR_BLUESKY_TAGS` when running tests. Tests marked `clickhouse` need a live ClickHouse
+Do not set `RADAR_BLUESKY_TAGS` or `SENTRY_DSN` when running tests. Tests marked `clickhouse` need a live ClickHouse
 (`CLICKHOUSE_TEST_URL`, `CLICKHOUSE_TEST_USER`, `CLICKHOUSE_TEST_PASSWORD`) and are skipped otherwise:
 `uv run pytest -m clickhouse`. Tests need no broker.
 

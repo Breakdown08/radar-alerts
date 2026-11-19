@@ -2,9 +2,12 @@
 
 import json
 import re
+import shutil
+import subprocess
 import tomllib
 from pathlib import Path
 
+import pytest
 import yaml
 
 ROOT: Path = Path(__file__).resolve().parents[1]
@@ -105,7 +108,7 @@ def test_ignore_files() -> None:
 
 def test_compose_services() -> None:
     """Check 31."""
-    assert set(services()) == {"db", "rabbitmq", "migrate", "web", "worker", "beat"}
+    assert set(services()) == {"db", "rabbitmq", "migrate", "web", "worker", "beat", "nginx"}
     assert "include" not in compose()
     name: str
     for name in APP_SERVICES:
@@ -192,7 +195,11 @@ def test_env_example() -> None:
         "TELEGRAM_API_URL=https://api.telegram.org",
         "TELEGRAM_WEBHOOK_SECRET=",
         "TELEGRAM_WEBHOOK_URL=",
-        "WEB_PORT=8000",
+        "HTTP_PORT=8080",
+        "SENTRY_DSN=",
+        "SENTRY_ENVIRONMENT=production",
+        "SENTRY_RELEASE=",
+        "SENTRY_TRACES_SAMPLE_RATE=0",
         "DOCKER_CLICKHOUSE_URL=http://clickhouse:8123",
         "RADAR_DOCKER_NETWORK=gamedev-trends_default",
         "POSTGRES_PASSWORD=",
@@ -203,6 +210,7 @@ def test_env_example() -> None:
     line: str
     for line in expected:
         assert line in lines
+    assert not any(line.startswith("WEB_PORT=") for line in lines)
 
 
 def test_ci_jobs_and_compose_steps() -> None:
@@ -221,6 +229,10 @@ def test_ci_jobs_and_compose_steps() -> None:
         "curl",
         "/healthz",
         "/static/admin/",
+        "127.0.0.1:8080/healthz",
+        "127.0.0.1:8080/static/admin/",
+        "nginx -t",
+        "x-content-type-options",
         "id -u",
         "grep -F",
         "ci-db-password",
@@ -238,6 +250,8 @@ def test_ci_jobs_and_compose_steps() -> None:
     for snippet in snippets:
         assert snippet in text, snippet
     assert "api.telegram.org" not in text
+    assert "127.0.0.1:8000/static" not in text
+    assert text.count("127.0.0.1:8000") == 1
     steps: object = job["steps"]
     assert isinstance(steps, list)
     teardown: list[object] = [s for s in steps if "docker compose down -v" in json.dumps(s)]
@@ -252,7 +266,11 @@ def test_pyproject_dependencies() -> None:
     assert isinstance(project, dict)
     deps: list[str] = project["dependencies"]
     names: list[str] = [re.split(r"[<>=\[ ;~!]", d)[0].lower() for d in deps]
-    assert {"gunicorn", "whitenoise"} <= set(names)
+    assert {"gunicorn", "whitenoise", "sentry-sdk"} <= set(names)
+    sentry: str = next(d for d in deps if d.lower().startswith("sentry-sdk"))
+    match: re.Match[str] | None = re.search(r"\[([^\]]*)\]", sentry)
+    assert match is not None
+    assert {e.strip() for e in match.group(1).split(",")} == {"django", "celery"}
     groups: object = data["dependency-groups"]
     assert isinstance(groups, dict)
     dev: list[str] = [re.split(r"[<>=\[ ;~!]", d)[0].lower() for d in groups["dev"] if isinstance(d, str)]
@@ -279,3 +297,145 @@ def test_readme() -> None:
     ):
         assert phrase in text, phrase
     assert "kadath" not in text.lower()
+    for phrase in ("nginx", "deploy/nginx.conf", "HTTP_PORT", "SENTRY_DSN", "SENTRY_TRACES_SAMPLE_RATE"):
+        assert phrase in text, phrase
+    assert any("sentry" in h.lower() for h in headings)
+    assert "No TLS and no reverse proxy" not in text
+    assert "WEB_PORT" not in text
+    assert "listen 443" in text or "TLS would" in text
+
+
+NGINX_IMAGE_RE: str = r"^nginx:\d+\.\d+\.\d+-alpine$"
+EXPECTED_DIRECTIVES: tuple[str, ...] = (
+    "listen 80",
+    "server_tokens off",
+    "client_max_body_size 1m",
+    "gzip on",
+    "gzip_proxied any",
+    "proxy_pass http://web:8000",
+    "proxy_set_header Host $http_host",
+    "proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for",
+    "proxy_set_header X-Forwarded-Proto $scheme",
+    "proxy_hide_header X-Content-Type-Options",
+    "proxy_hide_header X-Frame-Options",
+    "proxy_hide_header Referrer-Policy",
+    'add_header X-Content-Type-Options "nosniff" always',
+    'add_header X-Frame-Options "DENY" always',
+    'add_header Referrer-Policy "same-origin" always',
+)
+
+
+def nginx_text() -> str:
+    """deploy/nginx.conf without comments."""
+    return re.sub(r"#[^\n]*", "", read("deploy/nginx.conf"))
+
+
+def nginx_directives() -> set[str]:
+    parts: list[str] = re.split(r"[;{}]", nginx_text())
+    return {" ".join(p.split()) for p in parts if p.strip()}
+
+
+def test_nginx_service() -> None:
+    """Check 18."""
+    nginx: dict[str, object] = services()["nginx"]
+    image: object = nginx["image"]
+    assert isinstance(image, str)
+    assert re.match(NGINX_IMAGE_RE, image)
+    key: str
+    for key in ("build", "env_file", "environment"):
+        assert key not in nginx
+    assert nginx["ports"] == ["127.0.0.1:${HTTP_PORT:-8080}:80"]
+    assert nginx["volumes"] == ["./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro"]
+
+
+def test_nginx_depends_on_web_with_restart() -> None:
+    """Check 19."""
+    depends_on: object = services()["nginx"]["depends_on"]
+    assert isinstance(depends_on, dict)
+    assert depends_on["web"] == {"condition": "service_healthy", "restart": True}
+
+
+def test_nginx_healthcheck() -> None:
+    """Check 20."""
+    check: object = services()["nginx"].get("healthcheck")
+    assert isinstance(check, dict)
+    test: object = check["test"]
+    assert isinstance(test, list)
+    assert any("/healthz" in str(item) for item in test)
+    assert "Host: localhost" in test
+
+
+def test_only_nginx_publishes_http_ports() -> None:
+    """Check 21."""
+    assert "ports" not in services()["web"]
+    name: str
+    service: dict[str, object]
+    for name, service in services().items():
+        if name == "nginx":
+            continue
+        port: str
+        for port in listed(service.get("ports")):
+            assert not port.endswith(":8000"), (name, port)
+            assert not port.endswith(":80"), (name, port)
+
+
+def test_nginx_not_in_radar_network() -> None:
+    """Check 22: the service exists and stays out of radar."""
+    assert "nginx" in services()
+    assert "radar" not in listed(services()["nginx"].get("networks"))
+
+
+def test_nginx_conf_directives() -> None:
+    """Check 23."""
+    found: set[str] = nginx_directives()
+    wanted: str
+    for wanted in EXPECTED_DIRECTIVES:
+        assert wanted in found, wanted
+    assert any(d.startswith("gzip_types") and "application/json" in d for d in found)
+    prefix: str
+    for prefix in (
+        "proxy_connect_timeout",
+        "proxy_read_timeout",
+        "proxy_send_timeout",
+        "client_body_timeout",
+    ):
+        assert any(d.startswith(prefix) for d in found), prefix
+
+
+def test_nginx_conf_exclusions() -> None:
+    """Check 24."""
+    text: str = nginx_text()
+    forbidden: str
+    for forbidden in ("listen 443", " ssl", "upstream", "proxy_set_header Host $host"):
+        assert forbidden not in text, forbidden
+    match: re.Match[str] | None = re.search(r"location\s+/\s*\{([^}]*)\}", text)
+    assert match is not None
+    assert "add_header" not in match.group(1)
+
+
+def test_nginx_conf_passes_nginx_t() -> None:
+    """Check 25: optional, never pulls an image."""
+    if shutil.which("docker") is None:
+        pytest.skip("docker is not installed")
+    image: object = services()["nginx"]["image"]
+    assert isinstance(image, str)
+    inspect: subprocess.CompletedProcess[bytes] = subprocess.run(
+        ["docker", "image", "inspect", image], capture_output=True, timeout=60
+    )
+    if inspect.returncode != 0:
+        pytest.skip(f"{image} is not pulled")
+    run: subprocess.CompletedProcess[bytes] = subprocess.run(
+        [
+            "docker", "run", "--rm", "--add-host", "web:127.0.0.1",
+            "-v", f"{ROOT}/deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro",
+            image, "nginx", "-t",
+        ],
+        capture_output=True,
+        timeout=60,
+    )  # fmt: skip
+    assert run.returncode == 0, run.stderr.decode()
+
+
+def test_uv_lock_has_sentry() -> None:
+    """Check 28."""
+    assert 'name = "sentry-sdk"' in read("uv.lock")

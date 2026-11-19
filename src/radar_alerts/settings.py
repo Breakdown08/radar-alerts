@@ -6,6 +6,8 @@ from urllib.parse import quote
 import django_stubs_ext
 from django.core.exceptions import ImproperlyConfigured
 
+from radar_alerts.sentry import init_sentry
+
 django_stubs_ext.monkeypatch()
 
 BASE_DIR: Path = Path(__file__).resolve().parents[2]
@@ -192,3 +194,8 @@ TELEGRAM_MODE: str = telegram_mode(os.environ.get("TELEGRAM_MODE", ""), TELEGRAM
 TELEGRAM_WEBHOOK_URL: str = os.environ.get("TELEGRAM_WEBHOOK_URL", "").rstrip("/")
 TELEGRAM_API_URL: str = telegram_api_url(os.environ.get("TELEGRAM_API_URL", ""))
 CELERY_BEAT_SCHEDULE: dict[str, dict[str, object]] = beat_schedule(TELEGRAM_MODE)
+
+# The proxy (nginx) always overwrites X-Forwarded-Proto; Host is passed through as is.
+SECURE_PROXY_SSL_HEADER: tuple[str, str] = ("HTTP_X_FORWARDED_PROTO", "https")
+
+SENTRY_ENABLED: bool = init_sentry(os.environ)

@@ -87,10 +87,13 @@ jobs:
                  -v "$PWD/tests/telegram_stub.py:/stub.py:ro" python:3.14.7-slim-trixie python /stub.py
       - name: Bring the stack up
         run: docker compose up -d --build --wait --wait-timeout 240
-      - name: Check web, static and users
+      - name: Check nginx, web, static and users
         run: |
-          curl -fsS http://127.0.0.1:8000/healthz
-          curl -fsS -o /dev/null http://127.0.0.1:8000/static/admin/css/base.css
+          curl -fsS http://127.0.0.1:8080/healthz
+          curl -fsS -o /dev/null http://127.0.0.1:8080/static/admin/css/base.css
+          curl -fsSI http://127.0.0.1:8080/healthz | grep -qi '^x-content-type-options: nosniff'
+          docker compose exec -T nginx nginx -t
+          ! curl -s -o /dev/null http://127.0.0.1:8000/healthz
           test "$(docker compose exec -T web id -u)" != "0"
           test "$(docker compose exec -T worker id -u)" != "0"
           docker compose exec -T web python manage.py check
