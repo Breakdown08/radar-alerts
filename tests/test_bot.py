@@ -7,6 +7,7 @@ from factories import make_user
 from fakes import NOW, FakeTelegram, permanent
 
 from radar_alerts.alerts.bot import (
+    CURSOR_STALE_AFTER,
     INVALID_CODE_TEXT,
     LINKED_TEXT,
     START_HELP_TEXT,
@@ -194,3 +195,26 @@ def test_get_updates_error_propagates_and_keeps_the_cursor() -> None:
     with pytest.raises(TelegramError):
         poll_once(telegram, NOW)
     assert BotCursor.objects.get(pk=1).offset == 4
+
+
+def test_poll_once_restarts_from_zero_after_a_stale_cursor() -> None:
+    """Check 43: after a week of silence Telegram may restart ids below the cursor; they are new."""
+    BotCursor.objects.create(pk=1, offset=900, advanced_at=NOW - CURSOR_STALE_AFTER)
+    telegram: FakeTelegram = FakeTelegram()
+    telegram.batches = [[message("/start", chat=111, update_id=42)]]
+    assert poll_once(telegram, NOW) == 1
+    assert telegram.updates_calls == [(0, 0)]
+    assert telegram.sent == [(111, START_HELP_TEXT)]
+    cursor: BotCursor = BotCursor.objects.get(pk=1)
+    assert (cursor.offset, cursor.advanced_at) == (43, NOW)
+
+
+def test_poll_once_trusts_a_recent_cursor() -> None:
+    """Check 43 (boundary): a cursor that moved less than CURSOR_STALE_AFTER ago keeps its offset."""
+    BotCursor.objects.create(pk=1, offset=900, advanced_at=NOW - CURSOR_STALE_AFTER + timedelta(seconds=1))
+    telegram: FakeTelegram = FakeTelegram()
+    telegram.batches = [[message("/start", chat=111, update_id=42)]]
+    assert poll_once(telegram, NOW) == 0
+    assert telegram.updates_calls == [(900, 0)]
+    assert telegram.sent == []
+    assert BotCursor.objects.get(pk=1).offset == 900

@@ -2,7 +2,7 @@
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 from django.test import Client
@@ -12,8 +12,10 @@ from fakes import NOW, FakeTelegram
 from pytest_django.fixtures import Settings
 
 from radar_alerts.alerts.bot import (
+    CURSOR_STALE_AFTER,
     INVALID_CODE_TEXT,
     LINKED_TEXT,
+    START_HELP_TEXT,
     Reply,
     accept_update,
     issue_link_code,
@@ -164,6 +166,21 @@ def test_accept_update_takes_the_current_offset() -> None:
     reply: Reply | None = accept_update(update(f"/start {code}", update_id=10, chat=5), NOW)
     assert reply == Reply(5, LINKED_TEXT.format(username="alice"))
     assert BotCursor.objects.get(pk=1).offset == 11
+
+
+def test_accept_update_takes_a_lower_id_after_a_stale_cursor() -> None:
+    """Check 22: after a week of silence Telegram may restart ids below the cursor; they are new."""
+    BotCursor.objects.create(pk=1, offset=900, advanced_at=NOW - CURSOR_STALE_AFTER)
+    assert accept_update(update("/start", update_id=42, chat=5), NOW) == Reply(5, START_HELP_TEXT)
+    cursor: BotCursor = BotCursor.objects.get(pk=1)
+    assert (cursor.offset, cursor.advanced_at) == (43, NOW)
+
+
+def test_accept_update_drops_a_lower_id_while_the_cursor_is_recent() -> None:
+    """Check 22 (boundary): just under CURSOR_STALE_AFTER a lower id is still a repeat."""
+    BotCursor.objects.create(pk=1, offset=900, advanced_at=NOW - CURSOR_STALE_AFTER + timedelta(seconds=1))
+    assert accept_update(update("/start", update_id=42, chat=5), NOW) is None
+    assert BotCursor.objects.get(pk=1).offset == 900
 
 
 def test_accept_update_creates_the_cursor() -> None:

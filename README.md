@@ -143,7 +143,7 @@ with 409.
 - Switch back: `telegram_webhook delete`, set `TELEGRAM_MODE=polling`, recreate the containers.
 - `telegram_webhook info` prints the URL, the pending update count and the last error.
 
-An update is handled once: the offset cursor is shared by both modes, so a repeat from Telegram is dropped.
+An update is handled once: the offset cursor is shared by both modes, so a repeat from Telegram is dropped. After a week without updates Telegram may restart update ids below the cursor, so a cursor that has not moved for 6 days is not trusted: polling starts from 0 again and the webhook takes the update.
 
 ## Measured
 

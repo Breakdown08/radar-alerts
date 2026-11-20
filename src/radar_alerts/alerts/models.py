@@ -136,3 +136,6 @@ class LinkCode(models.Model):
 
 class BotCursor(models.Model):
     offset: models.BigIntegerField[int, int] = models.BigIntegerField(default=0)
+    advanced_at: models.DateTimeField[datetime | None, datetime | None] = models.DateTimeField(
+        null=True, blank=True
+    )
